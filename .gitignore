@@ -1,0 +1,16 @@
+# Never commit proprietary game binaries, backups, or saves
+*.exe
+*.dll
+*.bak
+*.cfg
+*.Cfg
+*.sma
+*.inf
+Save/
+Log/
+ScreenShot/
+Screenshots/
+__pycache__/
+*.pyc
+.venv/
+venv/
