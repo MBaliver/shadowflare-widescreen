@@ -14,6 +14,10 @@ A standalone, zero-dependency Python binary patcher for **ShadowFlare: Episode O
 - **Centered Bottom-Anchored HUD:** All original UI panels, menus, and the bottom bar remain centered (`+ox` horizontally, `+oy` vertically) without stretching or distorting sprites.
 - **Fixed Side-Band Clicking & Side Panels:** Clicking in the extra ultrawide bands to the left of Status/Skills/Shop or to the right of Equipment/Inventory passes cleanly to the world instead of being swallowed by UI bounds checks.
 - **Full-Width Rendering With Panels Open:** Opening left-hand panels (Status, Magic, Shop, Storage) or right-hand panels (Equipment) shifts the camera away from the panel while continuing to render the entire screen width every frame (no frozen side strips or cursor trails).
+- **Full-Screen Hover Labels:** Enemy names/HP, NPCs, and ground item tooltips (`FUN_00416bb0`) work across the entire ultrawide screen, including beside open panels and in the lower side bands.
+- **Ultrawide `PrintScreen` Screenshots:** In-game screenshots (`ScreenShot_00000000.Bmp`) are saved at the full patched resolution instead of `640×480`.
+- **Mouse Wheel Magic Cycling (`WM_MOUSEWHEEL`):** Scroll up/down in combat to cycle through assigned `F1–F8` magic hotkeys (can be disabled with `--no-wheel`).
+- **Optional Frame Rate / Tick Speed (`--fps`):** Adjusts the `33 ms` (`~30 FPS`) loop cap in `RKC_DBFCONTROL.dll`. *(Note: ShadowFlare has no delta-time — game speed scales proportionally above 30 FPS, so values like `--fps 40` act as a mild turbo mode.)*
 - **Safe & Reversible:** Automatically verifies original SHA-256 hashes, saves `.orig.bak` backups, and supports `--restore`.
 
 ---

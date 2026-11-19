@@ -14,6 +14,10 @@ Patcher binário em Python (sem dependências externas) para **ShadowFlare: Epis
 - **HUD centralizada ancorada embaixo:** Todos os menus, painéis e a barra inferior permanecem centralizados (`+ox` na horizontal, `+oy` na vertical), sem esticar ou distorcer os sprites.
 - **Cliques laterais funcionando com menus abertos:** Clicar nas faixas extras à esquerda do menu de Status/Magia/Loja ou à direita do menu de Equipamentos/Inventário vai direto para o mapa, sem ser engolido pelas checagens antigas de `640×480`.
 - **Tela inteira redesenhada com painéis abertos:** Abrir painéis à esquerda (Status, Magia, Loja, Baú) ou à direita (Equipamentos) desloca a câmera para fora do painel mantendo a largura inteira renderizada todo frame (sem faixas congeladas nem rastro do cursor).
+- **Hover em toda a tela ultrawide:** Nomes/HP de inimigos, NPCs e itens no chão (`FUN_00416bb0`) funcionam em toda a tela, inclusive ao lado dos menus abertos e nas faixas inferiores laterais.
+- **Screenshots (`PrintScreen`) em ultrawide:** Os arquivos `ScreenShot_00000000.Bmp` passam a ser salvos na resolução completa em vez de `640×480`.
+- **Rodinha do mouse para trocar magias (`WM_MOUSEWHEEL`):** Gire o scroll para cima/baixo para alternar rapidamente entre os atalhos de magia configurados em `F1–F8` (pode ser desativado com `--no-wheel`).
+- **Ajuste opcional de FPS / Tick (`--fps`):** Altera o limite de `33 ms` (`~30 FPS`) em `RKC_DBFCONTROL.dll`. *(Obs.: o jogo não usa delta-time, então valores acima de 30 FPS aceleram a velocidade do jogo proporcionalmente — ex.: `--fps 40` funciona como um turbo leve.)*
 - **Seguro e reversível:** Valida o SHA-256 dos arquivos originais, cria backups `.orig.bak` automaticamente e suporta `--restore`.
 
 ---
