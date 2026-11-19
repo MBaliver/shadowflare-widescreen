@@ -37,6 +37,27 @@ PRESETS = {
     "21:9-native": (2560, 1080),
 }
 
+# Key table at VA 0x47fac0 (file offset 0x7fac0): index -> (default_name, VK code)
+KEY_TABLE_OFF = 0x7fac0
+KEY_NAME_TO_INDEX: dict[str, int] = {
+    "SHIFT": 2, "CTRL": 3, "ALT": 4,
+    "UP": 6, "DOWN": 7, "LEFT": 8, "RIGHT": 9,
+    "TAB": 12, "ESC": 13, "ENTER": 14, "SPACE": 15,
+    **{chr(ord("A") + i): 16 + i for i in range(26)},
+    **{str(i): 42 + i for i in range(10)},
+}
+KEY_NAME_TO_VK: dict[str, int] = {
+    "SHIFT": 0x10, "CTRL": 0x11, "ALT": 0x12,
+    "UP": 0x26, "DOWN": 0x28, "LEFT": 0x25, "RIGHT": 0x27,
+    "TAB": 0x09, "ESC": 0x1B, "ENTER": 0x0D, "SPACE": 0x20,
+    "CAPSLOCK": 0x14, "BACKSPACE": 0x08, "DELETE": 0x2E, "INSERT": 0x2D,
+    "HOME": 0x24, "END": 0x23, "PGUP": 0x21, "PGDN": 0x22,
+    **{chr(c): c for c in range(ord("A"), ord("Z") + 1)},
+    **{chr(c): c for c in range(ord("0"), ord("9") + 1)},
+    **{f"F{i}": 0x6F + i for i in range(1, 13)},
+    **{f"NUM{i}": 0x60 + i for i in range(10)},
+}
+
 
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -60,6 +81,77 @@ def i32(val: int) -> bytes:
 
 def u32(val: int) -> bytes:
     return struct.pack("<I", val)
+
+
+class AsmBuf:
+    """Minimal pure-Python x86-32 label/jump resolver for code caves."""
+
+    def __init__(self, base_va: int) -> None:
+        self.base_va = base_va
+        self.buf = bytearray()
+        self.labels: dict[str, int] = {}
+        self.fixups: list[tuple[int, str]] = []
+
+    @property
+    def va(self) -> int:
+        return self.base_va + len(self.buf)
+
+    def emit(self, raw: bytes) -> None:
+        self.buf += raw
+
+    def label(self, name: str) -> None:
+        self.labels[name] = len(self.buf)
+
+    def jmp_label(self, name: str) -> None:
+        self.buf += b"\xe9"
+        self.fixups.append((len(self.buf), name))
+        self.buf += b"\x00\x00\x00\x00"
+
+    def jcc_label(self, cc: str, name: str) -> None:
+        op = {
+            "je": b"\x0f\x84",
+            "jne": b"\x0f\x85",
+            "jl": b"\x0f\x8c",
+            "jge": b"\x0f\x8d",
+            "jle": b"\x0f\x8e",
+            "jg": b"\x0f\x8f",
+        }[cc]
+        self.buf += op
+        self.fixups.append((len(self.buf), name))
+        self.buf += b"\x00\x00\x00\x00"
+
+    def call_va(self, target_va: int) -> None:
+        self.buf += call_rel32(self.va, target_va)
+
+    def jmp_va(self, target_va: int) -> None:
+        self.buf += jmp_rel32(self.va, target_va)
+
+    def finish(self) -> bytes:
+        for pos, name in self.fixups:
+            target = self.labels[name]
+            struct.pack_into("<i", self.buf, pos, target - (pos + 4))
+        return bytes(self.buf)
+
+
+def apply_key_remaps(data: bytearray, remaps: list[str]) -> list[tuple[str, str]]:
+    """
+    Remaps gameplay hotkeys in ShadowFlare's key table at 0x47fac0.
+    Format of each remap entry: ORIGINAL=NEW (e.g., I=E, S=C, 1=Q).
+    """
+    applied: list[tuple[str, str]] = []
+    for spec in remaps:
+        if "=" not in spec:
+            raise ValueError(f"Invalid remap '{spec}': expected ORIGINAL=NEW (e.g. I=E)")
+        orig_k, new_k = (s.strip().upper() for s in spec.split("=", 1))
+        if orig_k not in KEY_NAME_TO_INDEX:
+            raise ValueError(f"Unknown original key '{orig_k}'. Supported: {', '.join(sorted(KEY_NAME_TO_INDEX))}")
+        if new_k not in KEY_NAME_TO_VK:
+            raise ValueError(f"Unknown target key '{new_k}'. Supported: {', '.join(sorted(KEY_NAME_TO_VK))}")
+        idx = KEY_NAME_TO_INDEX[orig_k]
+        vk = KEY_NAME_TO_VK[new_k]
+        struct.pack_into("<I", data, KEY_TABLE_OFF + idx * 4, vk)
+        applied.append((orig_k, new_k))
+    return applied
 
 
 def patch_rkc_dbfcontrol(data: bytearray, fps: int) -> int:
@@ -178,7 +270,11 @@ def patch_rkc_updib(data: bytearray, width: int, height: int) -> None:
 
 
 def patch_shadowflare_exe(
-    data: bytearray, width: int, height: int, enable_wheel: bool = True
+    data: bytearray,
+    width: int,
+    height: int,
+    enable_wheel: bool = True,
+    enable_item_labels: bool = True,
 ) -> None:
     """
     Patches ShadowFlare.exe for custom internal resolution (width x height) and QoL:
@@ -190,6 +286,7 @@ def patch_shadowflare_exe(
     - UI left/right click dispatchers & FUN_00445750 world hit-test for ultrawide side bands
     - Full-screen hover labels (FUN_00416bb0) for enemies, NPCs, and ground items
     - Optional WM_MOUSEWHEEL magic cycling (F1–F8 hotkeys)
+    - Optional Diablo 2-style ALT toggle for ground item labels with rarity colors
     """
     ox = (width - 640) // 2
     oy = height - 480
@@ -205,8 +302,8 @@ def patch_shadowflare_exe(
         off = va_to_off(va)
         data[off : off + len(blob)] = blob
 
-    # 1. Expand .text VirtualSize from 0x71574 to 0x71b00 (RawSize is 0x72000)
-    struct.pack_into("<I", data, 0x1e8, 0x71b00)
+    # 1. Expand .text VirtualSize from 0x71574 to 0x71e00 (RawSize is 0x72000)
+    struct.pack_into("<I", data, 0x1e8, 0x71e00)
 
     # 2. Direct resolution constants (width x height)
     # RKC_DBFCONTROL::Initialize(height, width) at 0x401afc / 0x401b01
@@ -493,6 +590,202 @@ def patch_shadowflare_exe(
         # Patch 0x402ca5: 0f 87 <rel32> (ja cave_wheel)
         write_va(0x402ca5, b"\x0f\x87" + rel32(0x402ca5, cave_wheel, 6))
 
+    # 12. Optional Diablo 2-style ALT toggle for ground item labels (0x41f37b -> 0x472b00)
+    # Toggle flag lives in zero-initialized writable .data padding at VA 0x48ff00.
+    if enable_item_labels:
+        cave_items = 0x472b00
+        toggle_va = 0x48ff00
+        a = AsmBuf(cave_items)
+
+        # Save callee-saved regs + ecx (this = game_state)
+        a.emit(b"\x55\x53\x56\x57\x51")        # push ebp, ebx, esi, edi, ecx
+        a.emit(b"\x83\xec\x20")                # sub esp, 0x20
+        # Copy vsBlock from caller arg ([esp + 0x38]) into local [esp + 0x18]
+        a.emit(b"\x8b\x44\x24\x38")            # mov eax, [esp+0x38]
+        a.emit(b"\x89\x44\x24\x18")            # mov [esp+0x18], eax
+
+        # Check ALT pressed edge: [[0x48d8b4] + 4] + 0x80 == 1 -> xor [toggle_va], 1
+        a.emit(b"\xa1" + u32(0x48d8b4))        # mov eax, [0x48d8b4]
+        a.emit(b"\x85\xc0")
+        a.jcc_label("je", "check_toggle")
+        a.emit(b"\x8b\x40\x04")                # mov eax, [eax+4]
+        a.emit(b"\x85\xc0")
+        a.jcc_label("je", "check_toggle")
+        a.emit(b"\x83\xb8\x80\x00\x00\x00\x01")  # cmp dword ptr [eax+0x80], 1
+        a.jcc_label("jne", "check_toggle")
+        a.emit(b"\x83\x35" + u32(toggle_va) + b"\x01")  # xor dword ptr [toggle_va], 1
+
+        a.label("check_toggle")
+        a.emit(b"\x83\x3d" + u32(toggle_va) + b"\x00")  # cmp dword ptr [toggle_va], 0
+        a.jcc_label("je", "done")
+
+        # Get active player -> current map -> entity list
+        a.emit(b"\x8b\x0d" + u32(0x48ce0c))    # mov ecx, [0x48ce0c]
+        a.emit(b"\x85\xc9")
+        a.jcc_label("je", "done")
+        a.call_va(0x434cb0)                    # active player -> eax
+        a.emit(b"\x85\xc0")
+        a.jcc_label("je", "done")
+        a.emit(b"\x8b\x80\x58\x04\x00\x00")    # mov eax, [eax+0x458] (current map)
+        a.emit(b"\x85\xc0")
+        a.jcc_label("je", "done")
+        a.emit(b"\x8b\x40\x30")                # mov eax, [eax+0x30] (entity list)
+        a.emit(b"\x85\xc0")
+        a.jcc_label("je", "done")
+        a.emit(b"\x8b\x08")                    # mov ecx, [eax] (count)
+        a.emit(b"\x85\xc9")
+        a.jcc_label("jle", "done")
+        a.emit(b"\x89\x4c\x24\x14")            # mov [esp+0x14], ecx (count)
+        a.emit(b"\x8b\x40\x04")                # mov eax, [eax+4] (arr)
+        a.emit(b"\x85\xc0")
+        a.jcc_label("je", "done")
+        a.emit(b"\x89\x44\x24\x10")            # mov [esp+0x10], eax (arr)
+
+        # origin_x = camera_x - viewport_offset_x; origin_y = camera_y - viewport_offset_y
+        a.emit(b"\xa1" + u32(0x48cdf4))
+        a.emit(b"\x2b\x05" + u32(0x48cdfc))
+        a.emit(b"\x89\x44\x24\x08")            # [esp+0x08] = origin_x
+        a.emit(b"\xa1" + u32(0x48cdf8))
+        a.emit(b"\x2b\x05" + u32(0x48ce00))
+        a.emit(b"\x89\x44\x24\x0c")            # [esp+0x0c] = origin_y
+
+        # Loop edi = 0 .. count - 1
+        a.emit(b"\x31\xff")                    # xor edi, edi
+        a.label("loop")
+        a.emit(b"\x3b\x7c\x24\x14")            # cmp edi, [esp+0x14]
+        a.jcc_label("jge", "done")
+        a.emit(b"\x8b\x44\x24\x10")            # mov eax, [esp+0x10] (arr)
+        a.emit(b"\x8b\x04\xb8")                # mov eax, [eax + edi*4] (ent)
+        a.emit(b"\x85\xc0")
+        a.jcc_label("je", "next")
+        a.emit(b"\x83\x38\x03")                # cmp dword ptr [eax], 3 (ground item)
+        a.jcc_label("jne", "next")
+        a.emit(b"\x8b\x70\x08")                # mov esi, [eax+8] (obj)
+        a.emit(b"\x85\xf6")
+        a.jcc_label("je", "next")
+        a.emit(b"\x8b\x9e\xcc\x00\x00\x00")    # mov ebx, [esi+0xcc] (item)
+        a.emit(b"\x85\xdb")
+        a.jcc_label("je", "next")
+
+        # RKC_RPGSCRN::CalcRealPos([0x482d14], [esi+0x18], [esi+0x1c], &rx, &ry)
+        a.emit(b"\x8d\x44\x24\x04\x50")        # lea eax, [esp+4] (&ry); push eax
+        a.emit(b"\x8d\x44\x24\x04\x50")        # lea eax, [esp+4] (&rx); push eax
+        a.emit(b"\xff\x76\x1c")                # push [esi+0x1c]
+        a.emit(b"\xff\x76\x18")                # push [esi+0x18]
+        a.emit(b"\x8b\x0d" + u32(0x482d14))    # mov ecx, [0x482d14]
+        a.emit(b"\xff\x15" + u32(0x473358))    # call [CalcRealPos]
+
+        # sx = rx - origin_x (esi), sy = ry - origin_y - 24 (ebp)
+        a.emit(b"\x8b\x34\x24")                # mov esi, [esp+0x00] (rx)
+        a.emit(b"\x2b\x74\x24\x08")            # sub esi, [esp+0x08]
+        a.emit(b"\x8b\x6c\x24\x04")            # mov ebp, [esp+0x04] (ry)
+        a.emit(b"\x2b\x6c\x24\x0c")            # sub ebp, [esp+0x0c]
+        a.emit(b"\x83\xed\x18")                # sub ebp, 24
+
+        # Screen bounds check
+        a.emit(b"\x81\xfe" + i32(min_x))       # cmp esi, min_x
+        a.jcc_label("jl", "next")
+        a.emit(b"\x81\xfe" + i32(max_x - 24))  # cmp esi, max_x - 24
+        a.jcc_label("jg", "next")
+        a.emit(b"\x81\xfd" + i32(min_y))       # cmp ebp, min_y
+        a.jcc_label("jl", "next")
+        a.emit(b"\x81\xfd" + i32(405))         # cmp ebp, 405
+        a.jcc_label("jg", "next")
+
+        # Determine item name: Gold ("Gold" @ 0x47f14b), identified ([ebx+4]), or unidentified ([ebx+8])
+        a.emit(b"\x83\x7b\x0c\x04")            # cmp dword ptr [ebx+0x0c], 4
+        a.jcc_label("jne", "not_gold")
+        a.emit(b"\x83\x7b\x14\x00")            # cmp dword ptr [ebx+0x14], 0
+        a.jcc_label("jne", "not_gold")
+        a.emit(b"\xb8" + u32(0x47f14b))        # mov eax, "Gold"
+        a.jmp_label("have_name")
+
+        a.label("not_gold")
+        a.emit(b"\x83\x7b\x1c\x01")            # cmp dword ptr [ebx+0x1c], 1 (identified?)
+        a.jcc_label("jne", "unid")
+        a.emit(b"\x8b\x43\x04")                # mov eax, [ebx+4]
+        a.jmp_label("have_name")
+
+        a.label("unid")
+        a.emit(b"\x8b\x43\x08")                # mov eax, [ebx+8]
+
+        a.label("have_name")
+        a.emit(b"\x85\xc0")
+        a.jcc_label("je", "next")
+        a.emit(b"\x89\x44\x24\x1c")            # [esp+0x1c] = name_ptr
+
+        # Center horizontally by subtracting strlen(name) * 3 (6px font -> 3px half-char)
+        a.emit(b"\x89\xc2\x31\xc9")            # mov edx, eax; xor ecx, ecx
+        a.label("strlen")
+        a.emit(b"\x80\x3c\x0a\x00")            # cmp byte ptr [edx+ecx], 0
+        a.jcc_label("je", "strlen_done")
+        a.emit(b"\x41")                        # inc ecx
+        a.jmp_label("strlen")
+        a.label("strlen_done")
+        a.emit(b"\x8d\x04\x49")                # lea eax, [ecx + ecx*2] (len * 3)
+        a.emit(b"\x29\xc6")                    # sub esi, eax
+        a.emit(b"\x81\xfe" + i32(min_x))       # cmp esi, min_x
+        a.jcc_label("jge", "sx_ok")
+        a.emit(b"\xbe" + i32(min_x))           # mov esi, min_x
+        a.label("sx_ok")
+
+        # Draw black shadow at (sx+1, sy+1) on VScreen 0x11
+        a.emit(b"\x68\xe8\x03\x00\x00")        # push 1000
+        a.emit(b"\x6a\x01\x6a\x00\x6a\x00\x6a\x04")  # push 1, 0, 0, 4
+        a.emit(b"\x6a\x00\x6a\x00\x6a\x00")    # push B=0, G=0, R=0
+        a.emit(b"\xff\x74\x24\x3c")            # push name ([esp+0x1c+0x20])
+        a.emit(b"\x8d\x45\x01\x50")            # lea eax, [ebp+1]; push eax
+        a.emit(b"\x8d\x46\x01\x50")            # lea eax, [esi+1]; push eax
+        a.emit(b"\x6a\x00\x6a\x11")            # push font=0, VScreen=0x11
+        a.emit(b"\xff\x74\x24\x4c")            # push vsBlock ([esp+0x18+0x34])
+        a.emit(b"\x8b\x0d" + u32(0x482d10))    # mov ecx, [0x482d10]
+        a.emit(b"\xff\x15" + u32(0x47356c))    # call [SetStringsPacket]
+
+        # Select rarity color (eax=R, ecx=G, edx=B) from [ebx+0x18]
+        a.emit(b"\x8b\x53\x18")                # mov edx, [ebx+0x18]
+        a.emit(b"\x83\xfa\x01")
+        a.jcc_label("je", "col1")
+        a.emit(b"\x83\xfa\x02")
+        a.jcc_label("je", "col2")
+        a.emit(b"\x83\xfa\x03")
+        a.jcc_label("je", "col3")
+        # Normal (white)
+        a.emit(b"\xb8\xe0\x00\x00\x00\xb9\xe0\x00\x00\x00\xba\xe0\x00\x00\x00")
+        a.jmp_label("draw_fg")
+        a.label("col1")  # Magic (blue)
+        a.emit(b"\xb8\x80\x00\x00\x00\xb9\x90\x00\x00\x00\xba\xff\x00\x00\x00")
+        a.jmp_label("draw_fg")
+        a.label("col2")  # Rare (gold)
+        a.emit(b"\xb8\xff\x00\x00\x00\xb9\xd8\x00\x00\x00\xba\x40\x00\x00\x00")
+        a.jmp_label("draw_fg")
+        a.label("col3")  # Unique (orange)
+        a.emit(b"\xb8\xff\x00\x00\x00\xb9\x80\x00\x00\x00\xba\x30\x00\x00\x00")
+
+        a.label("draw_fg")
+        a.emit(b"\x68\xe8\x03\x00\x00")        # push 1000
+        a.emit(b"\x6a\x01\x6a\x00\x6a\x00\x6a\x04")  # push 1, 0, 0, 4
+        a.emit(b"\x52\x51\x50")                # push B(edx), G(ecx), R(eax)
+        a.emit(b"\xff\x74\x24\x3c")            # push name ([esp+0x1c+0x20])
+        a.emit(b"\x55\x56")                    # push sy(ebp), sx(esi)
+        a.emit(b"\x6a\x00\x6a\x11")            # push font=0, VScreen=0x11
+        a.emit(b"\xff\x74\x24\x4c")            # push vsBlock ([esp+0x18+0x34])
+        a.emit(b"\x8b\x0d" + u32(0x482d10))    # mov ecx, [0x482d10]
+        a.emit(b"\xff\x15" + u32(0x47356c))    # call [SetStringsPacket]
+
+        a.label("next")
+        a.emit(b"\x47")                        # inc edi
+        a.jmp_label("loop")
+
+        a.label("done")
+        a.emit(b"\x83\xc4\x20")                # add esp, 0x20
+        a.emit(b"\x59\x5f\x5e\x5b\x5d")        # pop ecx, edi, esi, ebx, ebp
+        a.jmp_va(0x4087b0)                     # tail-call original DrawCursor
+
+        item_blob = a.finish()
+        assert len(item_blob) <= 0x300, f"item labels cave overflow: {len(item_blob)}"
+        write_va(cave_items, item_blob)
+        write_va(0x41f37b, call_rel32(0x41f37b, cave_items))
+
 
 def restore_backups(game_dir: Path) -> None:
     for fname in ("ShadowFlare.exe", "RKC_UPDIB.dll", "RKC_DBFCONTROL.dll"):
@@ -548,6 +841,18 @@ def main() -> int:
         help="Disable mouse wheel cycling for F1–F8 magic hotkeys.",
     )
     parser.add_argument(
+        "--no-item-labels",
+        action="store_true",
+        help="Disable Diablo 2-style ALT toggle for ground item labels.",
+    )
+    parser.add_argument(
+        "--remap",
+        nargs="+",
+        metavar="ORIG=NEW",
+        default=[],
+        help="Remap gameplay hotkeys (e.g. --remap I=E S=C 1=Q 2=W). Does not affect text input.",
+    )
+    parser.add_argument(
         "--restore",
         action="store_true",
         help="Restore original binaries from .orig.bak backups.",
@@ -592,7 +897,18 @@ def main() -> int:
     updib_data = bytearray(updib_bak.read_bytes())
     dbf_data = bytearray(dbf_bak.read_bytes())
 
-    patch_shadowflare_exe(exe_data, width, height, enable_wheel=not args.no_wheel)
+    patch_shadowflare_exe(
+        exe_data,
+        width,
+        height,
+        enable_wheel=not args.no_wheel,
+        enable_item_labels=not args.no_item_labels,
+    )
+    try:
+        remapped = apply_key_remaps(exe_data, args.remap)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
     patch_rkc_updib(updib_data, width, height)
     frame_ms = patch_rkc_dbfcontrol(dbf_data, args.fps)
 
@@ -605,7 +921,10 @@ def main() -> int:
     print(f"  Hover labels:  full ultrawide enabled")
     print(f"  PrintScreen:   {width}x{height} BMP")
     print(f"  Mouse wheel:   {'F1-F8 magic cycling enabled' if not args.no_wheel else 'disabled'}")
+    print(f"  Item labels:   {'ALT toggle enabled' if not args.no_item_labels else 'disabled'}")
     print(f"  Frame cap:     {frame_ms} ms (~{1000/frame_ms:.1f} FPS)")
+    if remapped:
+        print("  Key remaps:    " + ", ".join(f"{o}->{n}" for o, n in remapped))
     return 0
 
 

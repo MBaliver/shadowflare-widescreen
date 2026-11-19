@@ -17,6 +17,8 @@ Patcher binário em Python (sem dependências externas) para **ShadowFlare: Epis
 - **Hover em toda a tela ultrawide:** Nomes/HP de inimigos, NPCs e itens no chão (`FUN_00416bb0`) funcionam em toda a tela, inclusive ao lado dos menus abertos e nas faixas inferiores laterais.
 - **Screenshots (`PrintScreen`) em ultrawide:** Os arquivos `ScreenShot_00000000.Bmp` passam a ser salvos na resolução completa em vez de `640×480`.
 - **Rodinha do mouse para trocar magias (`WM_MOUSEWHEEL`):** Gire o scroll para cima/baixo para alternar rapidamente entre os atalhos de magia configurados em `F1–F8` (pode ser desativado com `--no-wheel`).
+- **Toggle de itens no chão estilo Diablo 2 (`ALT`):** Aperte `ALT` uma vez para exibir o nome de todos os itens visíveis no chão com cores de raridade (branco = normal, azul = mágico, dourado = raro, laranja = único); aperte `ALT` novamente para ocultar (desative com `--no-item-labels`).
+- **Remapeamento de teclas (`--remap`):** Troque qualquer atalho da tabela de teclas do jogo (`I`, `S`, `M`, `R`, `X`, `H`, `TAB`, `SPACE`, `1–8`, etc.) sem afetar a digitação de texto/nomes (ex.: `--remap I=E S=C 1=Q 2=W`).
 - **Ajuste opcional de FPS / Tick (`--fps`):** Altera o limite de `33 ms` (`~30 FPS`) em `RKC_DBFCONTROL.dll`. *(Obs.: o jogo não usa delta-time, então valores acima de 30 FPS aceleram a velocidade do jogo proporcionalmente — ex.: `--fps 40` funciona como um turbo leve.)*
 - **Seguro e reversível:** Valida o SHA-256 dos arquivos originais, cria backups `.orig.bak` automaticamente e suporta `--restore`.
 
