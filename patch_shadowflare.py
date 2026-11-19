@@ -302,8 +302,11 @@ def patch_shadowflare_exe(
         off = va_to_off(va)
         data[off : off + len(blob)] = blob
 
-    # 1. Expand .text VirtualSize from 0x71574 to 0x71e00 (RawSize is 0x72000)
-    struct.pack_into("<I", data, 0x1e8, 0x71e00)
+    # 1. Expand .text VirtualSize from 0x71574 to 0x71f00 (RawSize is 0x72000)
+    #    and .data VirtualSize from 0x129c8 to 0x13000 so 0x48ff00..0x48ff07
+    #    (ALT item-label toggle & thread-safe wheel queue) lie inside declared .data.
+    struct.pack_into("<I", data, 0x1e8, 0x71f00)
+    struct.pack_into("<I", data, 0x238, 0x13000)
 
     # 2. Direct resolution constants (width x height)
     # RKC_DBFCONTROL::Initialize(height, width) at 0x401afc / 0x401b01
@@ -508,94 +511,67 @@ def patch_shadowflare_exe(
     write_va(cave_right, bytes(cr))
     write_va(0x445a5d, jmp_rel32(0x445a5d, cave_right) + b"\x90\x90")
 
-    # 11. Optional WM_MOUSEWHEEL (0x020A) magic cycling (F1–F8 hotkeys)
-    # Hooked at 0x402ca5: `ja 0x402ecb` -> `ja 0x4729c0`
+    # 10b. Fix FUN_00417b10 (world -> screen projection for hover tooltips & damage numbers)
+    # Replaces hardcoded 640x480 (-0x140, -0xf0, +-0xa0) with actual camera/viewport offsets.
+    proj = bytearray()
+    proj += b"\x83\xec\x08"                        # sub esp, 8 ([esp]=rx, [esp+4]=ry)
+    proj += b"\x8d\x44\x24\x04\x50"                # lea eax, [esp+4] (&ry); push eax
+    proj += b"\x8d\x44\x24\x04\x50"                # lea eax, [esp+4] (&rx); push eax
+    proj += b"\xff\x74\x24\x18"                    # push world_y
+    proj += b"\xff\x74\x24\x18"                    # push world_x
+    proj += b"\x8b\x0d" + u32(0x482d14)            # mov ecx, [0x482d14]
+    proj += b"\xff\x15" + u32(0x473358)            # call [CalcRealPos] (ret 0x10)
+    proj += b"\x8b\x04\x24"                        # mov eax, [esp+0] (rx)
+    proj += b"\x2b\x05" + u32(0x48cdf4)            # sub eax, camera_x
+    proj += b"\x03\x05" + u32(0x48cdfc)            # add eax, viewport_offset_x
+    proj += b"\x8b\x4c\x24\x14"                    # mov ecx, out_x
+    proj += b"\x89\x01"                            # mov [ecx], eax
+    proj += b"\x8b\x44\x24\x04"                    # mov eax, [esp+4] (ry)
+    proj += b"\x2b\x05" + u32(0x48cdf8)            # sub eax, camera_y
+    proj += b"\x03\x05" + u32(0x48ce00)            # add eax, viewport_offset_y
+    proj += b"\x8b\x4c\x24\x18"                    # mov ecx, out_y
+    proj += b"\x89\x01"                            # mov [ecx], eax
+    proj += b"\x83\xc4\x08"                        # add esp, 8
+    proj += b"\xc2\x10\x00"                        # ret 0x10
+    proj_pad = (0x417bd0 - 0x417b10) - len(proj)
+    assert proj_pad >= 0
+    proj += b"\x90" * proj_pad
+    write_va(0x417b10, bytes(proj))
+
+    # 11. Thread-safe WM_MOUSEWHEEL (0x020A) recorder on UI thread (0x402ca5 -> 0x4729c0)
+    # Only writes +1 (scroll down) or -1 (scroll up) to 0x48ff04; the worker thread
+    # consumes it safely in 0x472b00 without touching player pointers cross-thread.
+    toggle_va = 0x48ff00
+    wheel_va = 0x48ff04
+
     if enable_wheel:
         cave_wheel = 0x4729c0
-        cw = bytearray()
-
-        def wva() -> int:
-            return cave_wheel + len(cw)
-
-        # if (uMsg != WM_MOUSEWHEEL) goto DefWindowProc (0x402ecb)
-        cw += b"\x81\xfe\x0a\x02\x00\x00"            # cmp esi, 0x20a
-        cw += b"\x0f\x85" + rel32(wva(), 0x402ecb, 6)  # jne 0x402ecb
-
-        # ecx = DAT_0048ce0c (player manager); if (!ecx) return 0
-        cw += b"\x8b\x0d" + u32(0x48ce0c)            # mov ecx, [0x48ce0c]
-        cw += b"\x85\xc9"                            # test ecx, ecx
-        jz1 = len(cw)
-        cw += b"\x74\x00"                            # je ret_zero
-
-        # eax = FUN_00434cb0(ecx) (active player); if (!eax) return 0
-        cw += call_rel32(wva(), 0x434cb0)
-        cw += b"\x85\xc0"                            # test eax, eax
-        jz2 = len(cw)
-        cw += b"\x74\x00"                            # je ret_zero
-
-        # edx = cur_magic = [eax + 0x127c]
-        cw += b"\x8b\x90\x7c\x12\x00\x00"            # mov edx, [eax+0x127c]
-
-        # Find current index in DAT_0048d508[0..7] -> ecx (defaults to 0 if not found)
-        cw += b"\x31\xc9"                            # xor ecx, ecx
-        find_loop = len(cw)
-        cw += b"\x39\x14\x8d" + u32(0x48d508)        # cmp [ecx*4 + 0x48d508], edx
-        je_found = len(cw)
-        cw += b"\x74\x00"                            # je found
-        cw += b"\x41"                                # inc ecx
-        cw += b"\x83\xf9\x08"                        # cmp ecx, 8
-        cw += b"\x7c" + struct.pack("<b", find_loop - (len(cw) + 2))
-        cw += b"\x31\xc9"                            # xor ecx, ecx (fallback index 0)
-
-        found_pos = len(cw)
-        cw[je_found + 1] = found_pos - (je_found + 2)
-
-        # Read wheel delta = (short)[esp+0x3e]: <0 -> step=+1 (next), >0 -> step=-1 (prev)
-        cw += b"\x0f\xbf\x44\x24\x3e"                # movsx eax, word ptr [esp+0x3e]
-        cw += b"\x85\xc0"                            # test eax, eax
-        jz3 = len(cw)
-        cw += b"\x74\x00"                            # je ret_zero
-        cw += b"\xba\x01\x00\x00\x00"                # mov edx, 1
-        cw += b"\x78\x05"                            # js step_ready (delta < 0 => +1)
-        cw += b"\xba\xff\xff\xff\xff"                # mov edx, -1   (delta > 0 => -1)
-
-        # Search up to 8 slots for next assigned hotkey (!= -1)
-        cw += b"\xb8\x08\x00\x00\x00"                # mov eax, 8 (loop counter)
-        step_loop = len(cw)
-        cw += b"\x01\xd1"                            # add ecx, edx
-        cw += b"\x83\xe1\x07"                        # and ecx, 7
-        cw += b"\x83\x3c\x8d" + u32(0x48d508) + b"\xff"  # cmp dword ptr [ecx*4+0x48d508], -1
-        jne_hit = len(cw)
-        cw += b"\x75\x00"                            # jne hit
-        cw += b"\x48"                                # dec eax
-        cw += b"\x75" + struct.pack("<b", step_loop - (len(cw) + 2))
-        jmp_ret0 = len(cw)
-        cw += b"\xeb\x00"                            # jmp ret_zero
-
-        hit_pos = len(cw)
-        cw[jne_hit + 1] = hit_pos - (jne_hit + 2)
-        cw += b"\x89\x0d" + u32(0x48d52c)            # mov [0x48d52c], ecx
-
-        ret0_pos = len(cw)
-        cw[jz1 + 1] = ret0_pos - (jz1 + 2)
-        cw[jz2 + 1] = ret0_pos - (jz2 + 2)
-        cw[jz3 + 1] = ret0_pos - (jz3 + 2)
-        cw[jmp_ret0 + 1] = ret0_pos - (jmp_ret0 + 2)
-
-        # WndProc epilogue (matches 0x402c00): return 0
-        cw += b"\x5f\x5e\x31\xc0\x5b\x83\xc4\x24\xc2\x10\x00"
-
-        assert len(cw) <= 0x100, f"wheel cave overflow: {len(cw)}"
-        write_va(cave_wheel, bytes(cw))
-        # Patch 0x402ca5: 0f 87 <rel32> (ja cave_wheel)
+        w = AsmBuf(cave_wheel)
+        w.emit(b"\x81\xfe\x0a\x02\x00\x00")            # cmp esi, 0x20a
+        w.jcc_label("jne", "not_wheel")
+        w.emit(b"\x0f\xbf\x44\x24\x3e")                # movsx eax, word ptr [esp+0x3e]
+        w.emit(b"\x85\xc0")
+        w.jcc_label("je", "ret0")
+        w.emit(b"\xba\x01\x00\x00\x00")                # mov edx, +1 (delta < 0 -> next)
+        w.jcc_label("jl", "store")
+        w.emit(b"\xba\xff\xff\xff\xff")                # mov edx, -1 (delta > 0 -> prev)
+        w.label("store")
+        w.emit(b"\x89\x15" + u32(wheel_va))            # mov [wheel_va], edx
+        w.label("ret0")
+        w.emit(b"\x5f\x5e\x31\xc0\x5b\x83\xc4\x24\xc2\x10\x00")  # WndProc epilogue
+        w.label("not_wheel")
+        w.jmp_va(0x402ecb)
+        w_blob = w.finish()
+        assert len(w_blob) <= 0x100
+        write_va(cave_wheel, w_blob)
         write_va(0x402ca5, b"\x0f\x87" + rel32(0x402ca5, cave_wheel, 6))
 
-    # 12. Optional Diablo 2-style ALT toggle for ground item labels (0x41f37b -> 0x472b00)
-    # Toggle flag lives in zero-initialized writable .data padding at VA 0x48ff00.
-    if enable_item_labels:
-        cave_items = 0x472b00
-        toggle_va = 0x48ff00
-        a = AsmBuf(cave_items)
+    # 12. Per-frame worker-thread hook at 0x41f37b -> 0x472b00:
+    # - Consumes queued WM_MOUSEWHEEL direction from 0x48ff04 safely on the game thread
+    # - Handles Diablo 2-style ALT toggle (0x48ff00) to draw ground item labels
+    if enable_wheel or enable_item_labels:
+        cave_frame = 0x472b00
+        a = AsmBuf(cave_frame)
 
         # Save callee-saved regs + ecx (this = game_state)
         a.emit(b"\x55\x53\x56\x57\x51")        # push ebp, ebx, esi, edi, ecx
@@ -604,187 +580,238 @@ def patch_shadowflare_exe(
         a.emit(b"\x8b\x44\x24\x38")            # mov eax, [esp+0x38]
         a.emit(b"\x89\x44\x24\x18")            # mov [esp+0x18], eax
 
-        # Check ALT pressed edge: [[0x48d8b4] + 4] + 0x80 == 1 -> xor [toggle_va], 1
-        a.emit(b"\xa1" + u32(0x48d8b4))        # mov eax, [0x48d8b4]
-        a.emit(b"\x85\xc0")
-        a.jcc_label("je", "check_toggle")
-        a.emit(b"\x8b\x40\x04")                # mov eax, [eax+4]
-        a.emit(b"\x85\xc0")
-        a.jcc_label("je", "check_toggle")
-        a.emit(b"\x83\xb8\x80\x00\x00\x00\x01")  # cmp dword ptr [eax+0x80], 1
-        a.jcc_label("jne", "check_toggle")
-        a.emit(b"\x83\x35" + u32(toggle_va) + b"\x01")  # xor dword ptr [toggle_va], 1
+        # Only run gameplay QoL when not on loading screen (DAT_0048d8d4 < 0)
+        a.emit(b"\x83\x3d" + u32(0x48d8d4) + b"\x00")
+        a.jcc_label("jge", "done")
 
-        a.label("check_toggle")
-        a.emit(b"\x83\x3d" + u32(toggle_va) + b"\x00")  # cmp dword ptr [toggle_va], 0
-        a.jcc_label("je", "done")
-
-        # Get active player -> current map -> entity list
+        # Safely obtain active player pointer -> [esp+0x1c] temporarily (reused later for name)
         a.emit(b"\x8b\x0d" + u32(0x48ce0c))    # mov ecx, [0x48ce0c]
         a.emit(b"\x85\xc9")
         a.jcc_label("je", "done")
-        a.call_va(0x434cb0)                    # active player -> eax
+        a.emit(b"\x8b\x41\x08")                # eax = active_idx ([ecx+8])
         a.emit(b"\x85\xc0")
-        a.jcc_label("je", "done")
-        a.emit(b"\x8b\x80\x58\x04\x00\x00")    # mov eax, [eax+0x458] (current map)
-        a.emit(b"\x85\xc0")
-        a.jcc_label("je", "done")
-        a.emit(b"\x8b\x40\x30")                # mov eax, [eax+0x30] (entity list)
-        a.emit(b"\x85\xc0")
-        a.jcc_label("je", "done")
-        a.emit(b"\x8b\x08")                    # mov ecx, [eax] (count)
-        a.emit(b"\x85\xc9")
-        a.jcc_label("jle", "done")
-        a.emit(b"\x89\x4c\x24\x14")            # mov [esp+0x14], ecx (count)
-        a.emit(b"\x8b\x40\x04")                # mov eax, [eax+4] (arr)
-        a.emit(b"\x85\xc0")
-        a.jcc_label("je", "done")
-        a.emit(b"\x89\x44\x24\x10")            # mov [esp+0x10], eax (arr)
-
-        # origin_x = camera_x - viewport_offset_x; origin_y = camera_y - viewport_offset_y
-        a.emit(b"\xa1" + u32(0x48cdf4))
-        a.emit(b"\x2b\x05" + u32(0x48cdfc))
-        a.emit(b"\x89\x44\x24\x08")            # [esp+0x08] = origin_x
-        a.emit(b"\xa1" + u32(0x48cdf8))
-        a.emit(b"\x2b\x05" + u32(0x48ce00))
-        a.emit(b"\x89\x44\x24\x0c")            # [esp+0x0c] = origin_y
-
-        # Loop edi = 0 .. count - 1
-        a.emit(b"\x31\xff")                    # xor edi, edi
-        a.label("loop")
-        a.emit(b"\x3b\x7c\x24\x14")            # cmp edi, [esp+0x14]
+        a.jcc_label("jl", "done")
+        a.emit(b"\x3b\x01")                    # cmp active_idx, count ([ecx])
         a.jcc_label("jge", "done")
-        a.emit(b"\x8b\x44\x24\x10")            # mov eax, [esp+0x10] (arr)
-        a.emit(b"\x8b\x04\xb8")                # mov eax, [eax + edi*4] (ent)
+        a.emit(b"\x8b\x51\x04")                # edx = player_arr ([ecx+4])
+        a.emit(b"\x85\xd2")
+        a.jcc_label("je", "done")
+        a.emit(b"\x8b\x04\x82")                # eax = player = player_arr[active_idx]
         a.emit(b"\x85\xc0")
-        a.jcc_label("je", "next")
-        a.emit(b"\x83\x38\x03")                # cmp dword ptr [eax], 3 (ground item)
-        a.jcc_label("jne", "next")
-        a.emit(b"\x8b\x70\x08")                # mov esi, [eax+8] (obj)
-        a.emit(b"\x85\xf6")
-        a.jcc_label("je", "next")
-        a.emit(b"\x8b\x9e\xcc\x00\x00\x00")    # mov ebx, [esi+0xcc] (item)
-        a.emit(b"\x85\xdb")
-        a.jcc_label("je", "next")
+        a.jcc_label("je", "done")
+        a.emit(b"\x89\x44\x24\x10")            # temporarily save player in [esp+0x10]
 
-        # RKC_RPGSCRN::CalcRealPos([0x482d14], [esi+0x18], [esi+0x1c], &rx, &ry)
-        a.emit(b"\x8d\x44\x24\x04\x50")        # lea eax, [esp+4] (&ry); push eax
-        a.emit(b"\x8d\x44\x24\x04\x50")        # lea eax, [esp+4] (&rx); push eax
-        a.emit(b"\xff\x76\x1c")                # push [esi+0x1c]
-        a.emit(b"\xff\x76\x18")                # push [esi+0x18]
-        a.emit(b"\x8b\x0d" + u32(0x482d14))    # mov ecx, [0x482d14]
-        a.emit(b"\xff\x15" + u32(0x473358))    # call [CalcRealPos]
+        # 12a. Consume queued WM_MOUSEWHEEL step on the game thread
+        if enable_wheel:
+            a.emit(b"\x31\xd2")                        # xor edx, edx
+            a.emit(b"\x87\x15" + u32(wheel_va))        # xchg [wheel_va], edx (atomic pop!)
+            a.emit(b"\x85\xd2")
+            a.jcc_label("je", "after_wheel")
+            # edx = step (+1 or -1), eax = player
+            a.emit(b"\x8b\xb0\x7c\x12\x00\x00")        # mov esi, [eax+0x127c] (cur_magic)
+            a.emit(b"\x31\xc9")                        # xor ecx, ecx (idx = 0)
+            a.label("w_find")
+            a.emit(b"\x39\x34\x8d" + u32(0x48d508))    # cmp [ecx*4+0x48d508], esi
+            a.jcc_label("je", "w_found")
+            a.emit(b"\x41\x83\xf9\x08")                # inc ecx; cmp ecx, 8
+            a.jcc_label("jl", "w_find")
+            a.emit(b"\x31\xc9")                        # fallback idx = 0
+            a.label("w_found")
+            a.emit(b"\xbe\x08\x00\x00\x00")            # mov esi, 8 (tries)
+            a.label("w_step")
+            a.emit(b"\x01\xd1\x83\xe1\x07")            # ecx = (ecx + edx) & 7
+            a.emit(b"\x83\x3c\x8d" + u32(0x48d508) + b"\xff")  # cmp slot, -1
+            a.jcc_label("jne", "w_hit")
+            a.emit(b"\x4e")                            # dec esi
+            a.jcc_label("jne", "w_step")
+            a.jmp_label("after_wheel")
+            a.label("w_hit")
+            a.emit(b"\x89\x0d" + u32(0x48d52c))        # DAT_0048d52c = ecx
+            a.label("after_wheel")
 
-        # sx = rx - origin_x (esi), sy = ry - origin_y - 24 (ebp)
-        a.emit(b"\x8b\x34\x24")                # mov esi, [esp+0x00] (rx)
-        a.emit(b"\x2b\x74\x24\x08")            # sub esi, [esp+0x08]
-        a.emit(b"\x8b\x6c\x24\x04")            # mov ebp, [esp+0x04] (ry)
-        a.emit(b"\x2b\x6c\x24\x0c")            # sub ebp, [esp+0x0c]
-        a.emit(b"\x83\xed\x18")                # sub ebp, 24
+        # 12b. Diablo 2-style ALT toggle for ground item labels
+        if enable_item_labels:
+            # Check ALT pressed edge: [[0x48d8b4] + 4] + 0x80 == 1 -> xor [toggle_va], 1
+            a.emit(b"\xa1" + u32(0x48d8b4))
+            a.emit(b"\x85\xc0")
+            a.jcc_label("je", "check_toggle")
+            a.emit(b"\x8b\x40\x04")
+            a.emit(b"\x85\xc0")
+            a.jcc_label("je", "check_toggle")
+            a.emit(b"\x83\xb8\x80\x00\x00\x00\x01")
+            a.jcc_label("jne", "check_toggle")
+            a.emit(b"\x83\x35" + u32(toggle_va) + b"\x01")
 
-        # Screen bounds check
-        a.emit(b"\x81\xfe" + i32(min_x))       # cmp esi, min_x
-        a.jcc_label("jl", "next")
-        a.emit(b"\x81\xfe" + i32(max_x - 24))  # cmp esi, max_x - 24
-        a.jcc_label("jg", "next")
-        a.emit(b"\x81\xfd" + i32(min_y))       # cmp ebp, min_y
-        a.jcc_label("jl", "next")
-        a.emit(b"\x81\xfd" + i32(405))         # cmp ebp, 405
-        a.jcc_label("jg", "next")
+            a.label("check_toggle")
+            a.emit(b"\x83\x3d" + u32(toggle_va) + b"\x00")
+            a.jcc_label("je", "done")
 
-        # Determine item name: Gold ("Gold" @ 0x47f14b), identified ([ebx+4]), or unidentified ([ebx+8])
-        a.emit(b"\x83\x7b\x0c\x04")            # cmp dword ptr [ebx+0x0c], 4
-        a.jcc_label("jne", "not_gold")
-        a.emit(b"\x83\x7b\x14\x00")            # cmp dword ptr [ebx+0x14], 0
-        a.jcc_label("jne", "not_gold")
-        a.emit(b"\xb8" + u32(0x47f14b))        # mov eax, "Gold"
-        a.jmp_label("have_name")
+            # Verify RKC_RPGSCRN and RKC_UPDIB globals are non-null
+            a.emit(b"\x83\x3d" + u32(0x482d14) + b"\x00")
+            a.jcc_label("je", "done")
+            a.emit(b"\x83\x3d" + u32(0x482d10) + b"\x00")
+            a.jcc_label("je", "done")
 
-        a.label("not_gold")
-        a.emit(b"\x83\x7b\x1c\x01")            # cmp dword ptr [ebx+0x1c], 1 (identified?)
-        a.jcc_label("jne", "unid")
-        a.emit(b"\x8b\x43\x04")                # mov eax, [ebx+4]
-        a.jmp_label("have_name")
+            # Reload player -> current map -> entity list
+            a.emit(b"\x8b\x44\x24\x10")                # mov eax, player
+            a.emit(b"\x8b\x80\x58\x04\x00\x00")        # mov eax, [eax+0x458] (current map)
+            a.emit(b"\x85\xc0")
+            a.jcc_label("je", "done")
+            a.emit(b"\x8b\x40\x30")                    # mov eax, [eax+0x30] (entity list)
+            a.emit(b"\x85\xc0")
+            a.jcc_label("je", "done")
+            a.emit(b"\x8b\x08")                        # mov ecx, [eax] (count)
+            a.emit(b"\x85\xc9")
+            a.jcc_label("jle", "done")
+            a.emit(b"\x89\x4c\x24\x14")                # [esp+0x14] = count
+            a.emit(b"\x8b\x40\x04")                    # mov eax, [eax+4] (arr)
+            a.emit(b"\x85\xc0")
+            a.jcc_label("je", "done")
+            a.emit(b"\x89\x44\x24\x10")                # [esp+0x10] = arr
 
-        a.label("unid")
-        a.emit(b"\x8b\x43\x08")                # mov eax, [ebx+8]
+            # origin_x = camera_x - viewport_offset_x; origin_y = camera_y - viewport_offset_y
+            a.emit(b"\xa1" + u32(0x48cdf4))
+            a.emit(b"\x2b\x05" + u32(0x48cdfc))
+            a.emit(b"\x89\x44\x24\x08")                # [esp+0x08] = origin_x
+            a.emit(b"\xa1" + u32(0x48cdf8))
+            a.emit(b"\x2b\x05" + u32(0x48ce00))
+            a.emit(b"\x89\x44\x24\x0c")                # [esp+0x0c] = origin_y
 
-        a.label("have_name")
-        a.emit(b"\x85\xc0")
-        a.jcc_label("je", "next")
-        a.emit(b"\x89\x44\x24\x1c")            # [esp+0x1c] = name_ptr
+            # Loop edi = 0 .. count - 1
+            a.emit(b"\x31\xff")                        # xor edi, edi
+            a.label("loop")
+            a.emit(b"\x3b\x7c\x24\x14")                # cmp edi, count
+            a.jcc_label("jge", "done")
+            a.emit(b"\x8b\x44\x24\x10")                # mov eax, arr
+            a.emit(b"\x8b\x04\xb8")                    # mov eax, [eax + edi*4] (ent)
+            a.emit(b"\x85\xc0")
+            a.jcc_label("je", "next")
+            a.emit(b"\x83\x38\x03")                    # cmp dword ptr [eax], 3 (ground item)
+            a.jcc_label("jne", "next")
+            a.emit(b"\x8b\x70\x08")                    # mov esi, [eax+8] (obj)
+            a.emit(b"\x85\xf6")
+            a.jcc_label("je", "next")
+            a.emit(b"\x8b\x9e\xcc\x00\x00\x00")        # mov ebx, [esi+0xcc] (item)
+            a.emit(b"\x85\xdb")
+            a.jcc_label("je", "next")
 
-        # Center horizontally by subtracting strlen(name) * 3 (6px font -> 3px half-char)
-        a.emit(b"\x89\xc2\x31\xc9")            # mov edx, eax; xor ecx, ecx
-        a.label("strlen")
-        a.emit(b"\x80\x3c\x0a\x00")            # cmp byte ptr [edx+ecx], 0
-        a.jcc_label("je", "strlen_done")
-        a.emit(b"\x41")                        # inc ecx
-        a.jmp_label("strlen")
-        a.label("strlen_done")
-        a.emit(b"\x8d\x04\x49")                # lea eax, [ecx + ecx*2] (len * 3)
-        a.emit(b"\x29\xc6")                    # sub esi, eax
-        a.emit(b"\x81\xfe" + i32(min_x))       # cmp esi, min_x
-        a.jcc_label("jge", "sx_ok")
-        a.emit(b"\xbe" + i32(min_x))           # mov esi, min_x
-        a.label("sx_ok")
+            # CalcRealPos([0x482d14], [esi+0x18], [esi+0x1c], &rx, &ry)
+            a.emit(b"\x8d\x44\x24\x04\x50")
+            a.emit(b"\x8d\x44\x24\x04\x50")
+            a.emit(b"\xff\x76\x1c")
+            a.emit(b"\xff\x76\x18")
+            a.emit(b"\x8b\x0d" + u32(0x482d14))
+            a.emit(b"\xff\x15" + u32(0x473358))
 
-        # Draw black shadow at (sx+1, sy+1) on VScreen 0x11
-        a.emit(b"\x68\xe8\x03\x00\x00")        # push 1000
-        a.emit(b"\x6a\x01\x6a\x00\x6a\x00\x6a\x04")  # push 1, 0, 0, 4
-        a.emit(b"\x6a\x00\x6a\x00\x6a\x00")    # push B=0, G=0, R=0
-        a.emit(b"\xff\x74\x24\x3c")            # push name ([esp+0x1c+0x20])
-        a.emit(b"\x8d\x45\x01\x50")            # lea eax, [ebp+1]; push eax
-        a.emit(b"\x8d\x46\x01\x50")            # lea eax, [esi+1]; push eax
-        a.emit(b"\x6a\x00\x6a\x11")            # push font=0, VScreen=0x11
-        a.emit(b"\xff\x74\x24\x4c")            # push vsBlock ([esp+0x18+0x34])
-        a.emit(b"\x8b\x0d" + u32(0x482d10))    # mov ecx, [0x482d10]
-        a.emit(b"\xff\x15" + u32(0x47356c))    # call [SetStringsPacket]
+            # sx = rx - origin_x (esi), sy = ry - origin_y - 24 (ebp)
+            a.emit(b"\x8b\x34\x24")
+            a.emit(b"\x2b\x74\x24\x08")
+            a.emit(b"\x8b\x6c\x24\x04")
+            a.emit(b"\x2b\x6c\x24\x0c")
+            a.emit(b"\x83\xed\x18")
 
-        # Select rarity color (eax=R, ecx=G, edx=B) from [ebx+0x18]
-        a.emit(b"\x8b\x53\x18")                # mov edx, [ebx+0x18]
-        a.emit(b"\x83\xfa\x01")
-        a.jcc_label("je", "col1")
-        a.emit(b"\x83\xfa\x02")
-        a.jcc_label("je", "col2")
-        a.emit(b"\x83\xfa\x03")
-        a.jcc_label("je", "col3")
-        # Normal (white)
-        a.emit(b"\xb8\xe0\x00\x00\x00\xb9\xe0\x00\x00\x00\xba\xe0\x00\x00\x00")
-        a.jmp_label("draw_fg")
-        a.label("col1")  # Magic (blue)
-        a.emit(b"\xb8\x80\x00\x00\x00\xb9\x90\x00\x00\x00\xba\xff\x00\x00\x00")
-        a.jmp_label("draw_fg")
-        a.label("col2")  # Rare (gold)
-        a.emit(b"\xb8\xff\x00\x00\x00\xb9\xd8\x00\x00\x00\xba\x40\x00\x00\x00")
-        a.jmp_label("draw_fg")
-        a.label("col3")  # Unique (orange)
-        a.emit(b"\xb8\xff\x00\x00\x00\xb9\x80\x00\x00\x00\xba\x30\x00\x00\x00")
+            # Screen bounds check
+            a.emit(b"\x81\xfe" + i32(min_x))
+            a.jcc_label("jl", "next")
+            a.emit(b"\x81\xfe" + i32(max_x - 24))
+            a.jcc_label("jg", "next")
+            a.emit(b"\x81\xfd" + i32(min_y))
+            a.jcc_label("jl", "next")
+            a.emit(b"\x81\xfd" + i32(405))
+            a.jcc_label("jg", "next")
 
-        a.label("draw_fg")
-        a.emit(b"\x68\xe8\x03\x00\x00")        # push 1000
-        a.emit(b"\x6a\x01\x6a\x00\x6a\x00\x6a\x04")  # push 1, 0, 0, 4
-        a.emit(b"\x52\x51\x50")                # push B(edx), G(ecx), R(eax)
-        a.emit(b"\xff\x74\x24\x3c")            # push name ([esp+0x1c+0x20])
-        a.emit(b"\x55\x56")                    # push sy(ebp), sx(esi)
-        a.emit(b"\x6a\x00\x6a\x11")            # push font=0, VScreen=0x11
-        a.emit(b"\xff\x74\x24\x4c")            # push vsBlock ([esp+0x18+0x34])
-        a.emit(b"\x8b\x0d" + u32(0x482d10))    # mov ecx, [0x482d10]
-        a.emit(b"\xff\x15" + u32(0x47356c))    # call [SetStringsPacket]
+            # Determine item name: Gold ("Gold" @ 0x47f14b), identified ([ebx+4]), or unidentified ([ebx+8])
+            a.emit(b"\x83\x7b\x0c\x04")
+            a.jcc_label("jne", "not_gold")
+            a.emit(b"\x83\x7b\x14\x00")
+            a.jcc_label("jne", "not_gold")
+            a.emit(b"\xb8" + u32(0x47f14b))
+            a.jmp_label("have_name")
 
-        a.label("next")
-        a.emit(b"\x47")                        # inc edi
-        a.jmp_label("loop")
+            a.label("not_gold")
+            a.emit(b"\x83\x7b\x1c\x01")
+            a.jcc_label("jne", "unid")
+            a.emit(b"\x8b\x43\x04")
+            a.jmp_label("have_name")
+
+            a.label("unid")
+            a.emit(b"\x8b\x43\x08")
+
+            a.label("have_name")
+            a.emit(b"\x85\xc0")
+            a.jcc_label("je", "next")
+            a.emit(b"\x89\x44\x24\x1c")                # [esp+0x1c] = name_ptr
+
+            # Center horizontally by subtracting strlen(name) * 3
+            a.emit(b"\x89\xc2\x31\xc9")
+            a.label("strlen")
+            a.emit(b"\x80\x3c\x0a\x00")
+            a.jcc_label("je", "strlen_done")
+            a.emit(b"\x41")
+            a.jmp_label("strlen")
+            a.label("strlen_done")
+            a.emit(b"\x8d\x04\x49")
+            a.emit(b"\x29\xc6")
+            a.emit(b"\x81\xfe" + i32(min_x))
+            a.jcc_label("jge", "sx_ok")
+            a.emit(b"\xbe" + i32(min_x))
+            a.label("sx_ok")
+
+            # Draw black shadow at (sx+1, sy+1) using font 1, flags 0 (matches vanilla hover)
+            a.emit(b"\x68\xe8\x03\x00\x00")
+            a.emit(b"\x6a\x01\x6a\x00\x6a\x00\x6a\x00")  # push 1, 0, 0, flags=0
+            a.emit(b"\x6a\x00\x6a\x00\x6a\x00")
+            a.emit(b"\xff\x74\x24\x3c")                # push name
+            a.emit(b"\x8d\x45\x01\x50")
+            a.emit(b"\x8d\x46\x01\x50")
+            a.emit(b"\x6a\x01\x6a\x11")                # push font=1, VScreen=0x11
+            a.emit(b"\xff\x74\x24\x4c")                # push vsBlock
+            a.emit(b"\x8b\x0d" + u32(0x482d10))
+            a.emit(b"\xff\x15" + u32(0x47356c))
+
+            # Select rarity color (eax=R, ecx=G, edx=B) from [ebx+0x18]
+            a.emit(b"\x8b\x53\x18")
+            a.emit(b"\x83\xfa\x01")
+            a.jcc_label("je", "col1")
+            a.emit(b"\x83\xfa\x02")
+            a.jcc_label("je", "col2")
+            a.emit(b"\x83\xfa\x03")
+            a.jcc_label("je", "col3")
+            a.emit(b"\xb8\xe0\x00\x00\x00\xb9\xe0\x00\x00\x00\xba\xe0\x00\x00\x00")
+            a.jmp_label("draw_fg")
+            a.label("col1")
+            a.emit(b"\xb8\x80\x00\x00\x00\xb9\x90\x00\x00\x00\xba\xff\x00\x00\x00")
+            a.jmp_label("draw_fg")
+            a.label("col2")
+            a.emit(b"\xb8\xff\x00\x00\x00\xb9\xd8\x00\x00\x00\xba\x40\x00\x00\x00")
+            a.jmp_label("draw_fg")
+            a.label("col3")
+            a.emit(b"\xb8\xff\x00\x00\x00\xb9\x80\x00\x00\x00\xba\x30\x00\x00\x00")
+
+            a.label("draw_fg")
+            a.emit(b"\x68\xe8\x03\x00\x00")
+            a.emit(b"\x6a\x01\x6a\x00\x6a\x00\x6a\x00")  # push 1, 0, 0, flags=0
+            a.emit(b"\x52\x51\x50")
+            a.emit(b"\xff\x74\x24\x3c")
+            a.emit(b"\x55\x56")
+            a.emit(b"\x6a\x01\x6a\x11")                # push font=1, VScreen=0x11
+            a.emit(b"\xff\x74\x24\x4c")
+            a.emit(b"\x8b\x0d" + u32(0x482d10))
+            a.emit(b"\xff\x15" + u32(0x47356c))
+
+            a.label("next")
+            a.emit(b"\x47")
+            a.jmp_label("loop")
 
         a.label("done")
-        a.emit(b"\x83\xc4\x20")                # add esp, 0x20
-        a.emit(b"\x59\x5f\x5e\x5b\x5d")        # pop ecx, edi, esi, ebx, ebp
-        a.jmp_va(0x4087b0)                     # tail-call original DrawCursor
+        a.emit(b"\x83\xc4\x20")
+        a.emit(b"\x59\x5f\x5e\x5b\x5d")
+        a.jmp_va(0x4087b0)
 
-        item_blob = a.finish()
-        assert len(item_blob) <= 0x300, f"item labels cave overflow: {len(item_blob)}"
-        write_va(cave_items, item_blob)
-        write_va(0x41f37b, call_rel32(0x41f37b, cave_items))
+        frame_blob = a.finish()
+        assert len(frame_blob) <= 0x380, f"frame QoL cave overflow: {len(frame_blob)}"
+        write_va(cave_frame, frame_blob)
+        write_va(0x41f37b, call_rel32(0x41f37b, cave_frame))
 
 
 def restore_backups(game_dir: Path) -> None:
@@ -810,6 +837,13 @@ def ensure_backup(path: Path, expected_sha256: str, force: bool) -> Path:
             )
         shutil.copy2(path, bak)
         print(f"Created backup: {bak.name}")
+    elif not force and sha256_file(bak) != expected_sha256:
+        raise RuntimeError(
+            f"Existing backup {bak.name} SHA-256 mismatch (corrupted or already patched).\n"
+            f"  Expected: {expected_sha256}\n"
+            f"  Found:    {sha256_file(bak)}\n"
+            f"Replace {bak.name} with a clean original binary or use --force."
+        )
     return bak
 
 
